@@ -22,6 +22,10 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
 ]
 
+# Django defaults to "same-origin", which hides the Referer header from the map
+# tile server. OpenStreetMap blocks tile requests without it (HTTP 403).
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 DATABASES = {}
