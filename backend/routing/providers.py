@@ -1,5 +1,6 @@
 """Thin clients for the third-party APIs: geocoding, routing and weather."""
 import hashlib
+import logging
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +11,8 @@ from django.conf import settings
 from django.core.cache import cache
 
 from .geo import cumulative_m, haversine_m, interpolate_at
+
+logger = logging.getLogger(__name__)
 
 TIMEOUT = 25
 MM_PER_INCH = 25.4
@@ -34,7 +37,12 @@ def _get(url, **kwargs):
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as exc:
-        raise ProviderError(f"Upstream request failed: {exc.__class__.__name__}") from exc
+        # Name the provider and status so a failure can be diagnosed from the response.
+        status = getattr(exc.response, "status_code", None)
+        reason = f"HTTP {status}" if status else exc.__class__.__name__
+        host = url.split("/")[2]
+        logger.warning("Upstream request to %s failed: %s", host, reason)
+        raise ProviderError(f"Upstream request to {host} failed: {reason}") from exc
 
 
 # ----------------------------------------------------------------- geocoding
