@@ -25,9 +25,18 @@ WEATHER_TTL_S = 30 * 60
 class ProviderError(Exception):
     """A third-party API failed or returned nothing useful (maps to HTTP 502/400)."""
 
-    def __init__(self, message, status=502):
+    def __init__(self, message, status=502, upstream_status=None):
         super().__init__(message)
         self.status = status
+        self.upstream_status = upstream_status
+
+
+class WeatherRateLimited(Exception):
+    """Open-Meteo refused this server. The browser can fetch these cells instead."""
+
+    def __init__(self, cells):
+        super().__init__("The weather service is rate limiting this server.")
+        self.cells = sorted(cells)
 
 
 def _get(url, **kwargs):
@@ -42,7 +51,7 @@ def _get(url, **kwargs):
         reason = f"HTTP {status}" if status else exc.__class__.__name__
         host = url.split("/")[2]
         logger.warning("Upstream request to %s failed: %s", host, reason)
-        raise ProviderError(f"Upstream request to {host} failed: {reason}") from exc
+        raise ProviderError(f"Upstream request to {host} failed: {reason}", upstream_status=status) from exc
 
 
 # ----------------------------------------------------------------- geocoding
@@ -182,43 +191,78 @@ def _parse_time(text):
     return datetime.strptime(text, "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
 
 
+WEATHER_PARAMS = {
+    "hourly": "wind_speed_10m,rain,snowfall",
+    "wind_speed_unit": "mph",
+    "timezone": "GMT",
+    "past_days": 1,
+    "forecast_days": 16,
+}
+MAX_SUPPLIED_CELLS = 3000
+MAX_SERIES_HOURS = 500
+
+
+def _series(start, wind, rain, snow):
+    """Convert one Open-Meteo hourly block into the units the risk rules use."""
+    return {
+        "start": _parse_time(start),
+        "wind": [v or 0.0 for v in wind],  # mph
+        "rain": [(v or 0.0) / MM_PER_INCH for v in rain],  # in/hr
+        "snow": [(v or 0.0) / CM_PER_INCH for v in snow],  # in/hr
+    }
+
+
+def parse_supplied_weather(rows):
+    """Validate forecasts sent by the browser: [[lat, lon, start, wind, rain, snow], ...].
+
+    Raises ValueError on bad input. The result is used for that request only and
+    never cached, so one client cannot change what other users see.
+    """
+    if not isinstance(rows, list) or len(rows) > MAX_SUPPLIED_CELLS:
+        raise ValueError("bad weather list")
+    out = {}
+    for row in rows:
+        lat, lon, start, wind, rain, snow = row
+        columns = (wind, rain, snow)
+        if not all(isinstance(c, list) and 0 < len(c) <= MAX_SERIES_HOURS for c in columns):
+            raise ValueError("bad weather series")
+        if len({len(c) for c in columns}) != 1:
+            raise ValueError("weather series lengths differ")
+        if not all(v is None or (isinstance(v, (int, float)) and math.isfinite(v)) for c in columns for v in c):
+            raise ValueError("weather values must be numbers")
+        out[_grid_key(float(lat), float(lon))] = _series(str(start), wind, rain, snow)
+    return out
+
+
 def _fetch_chunk(cells):
     data = _get(
         settings.OPEN_METEO_URL,
         params={
             "latitude": ",".join(str(c[0]) for c in cells),
             "longitude": ",".join(str(c[1]) for c in cells),
-            "hourly": "wind_speed_10m,rain,snowfall",
-            "wind_speed_unit": "mph",
-            "timezone": "GMT",
-            "past_days": 1,
-            "forecast_days": 16,
+            **WEATHER_PARAMS,
         },
     )
     results = data if isinstance(data, list) else [data]  # one location -> a bare object
     out = {}
     for cell, item in zip(cells, results):
         hourly = item["hourly"]
-        out[cell] = {
-            "start": _parse_time(hourly["time"][0]),
-            "wind": [v or 0.0 for v in hourly["wind_speed_10m"]],  # mph
-            "rain": [(v or 0.0) / MM_PER_INCH for v in hourly["rain"]],  # in/hr
-            "snow": [(v or 0.0) / CM_PER_INCH for v in hourly["snowfall"]],  # in/hr
-        }
+        out[cell] = _series(hourly["time"][0], hourly["wind_speed_10m"], hourly["rain"], hourly["snowfall"])
     return out
 
 
-def fetch_weather(points):
+def fetch_weather(points, supplied=None):
     """Hourly forecast series for many (lat, lon) points.
 
     Returns {grid_cell: series}. Cells are cached for 30 minutes and missing
     ones are fetched in parallel batches (Open-Meteo accepts many locations
-    in a single request).
+    in a single request). Cells in `supplied` are used as given. Raises
+    WeatherRateLimited if Open-Meteo answers 429.
     """
     cells = {_grid_key(lat, lon) for lat, lon in points}
     found, missing = {}, []
     for cell in cells:
-        hit = cache.get(f"wx:{cell}")
+        hit = cache.get(f"wx:{cell}") or (supplied or {}).get(cell)
         if hit:
             found[cell] = hit
         else:
@@ -226,11 +270,16 @@ def fetch_weather(points):
 
     chunks = [missing[i : i + WEATHER_CHUNK] for i in range(0, len(missing), WEATHER_CHUNK)]
     if chunks:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            for chunk_result in pool.map(_fetch_chunk, chunks):
-                for cell, series in chunk_result.items():
-                    cache.set(f"wx:{cell}", series, WEATHER_TTL_S)
-                    found[cell] = series
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for chunk_result in pool.map(_fetch_chunk, chunks):
+                    for cell, series in chunk_result.items():
+                        cache.set(f"wx:{cell}", series, WEATHER_TTL_S)
+                        found[cell] = series
+        except ProviderError as exc:
+            if exc.upstream_status != 429:
+                raise
+            raise WeatherRateLimited(c for c in missing if c not in found) from exc
     return found
 
 

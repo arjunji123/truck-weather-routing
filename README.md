@@ -121,4 +121,6 @@ One Docker image serves both the API and the built React app.
 
 **Any Docker host:** `docker build -t truck-routing . && docker run -p 8000:8000 truck-routing`
 
+If Open-Meteo rate limits the server (HTTP 429, common on shared hosting IPs), the API asks the browser to fetch the forecasts and send them back. These are used for that request only and are not cached.
+
 Env vars: `DJANGO_SECRET_KEY` (set in production), `DJANGO_ALLOWED_HOSTS` (default `*`).

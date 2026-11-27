@@ -29,6 +29,8 @@ SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 DATABASES = {}
+# Room for the forecasts the browser sends when the server is rate limited.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 12 * 1024 * 1024
 USE_TZ = True
 TIME_ZONE = "UTC"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
